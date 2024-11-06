@@ -1,0 +1,333 @@
+<powershell>
+$s3BucketName = "${s3_bucket}"
+$installRootDir = "D:\Temp\Softwares\"
+
+$scriptDate = (Get-Date).toString("yyyyMMddHHmmss")
+$logFileName = "C:\Temp\UserDataLog_$scriptDate.log"
+
+$packages = @'
+{
+    "Packages" : [
+        {
+            "PackageName" : "SnowflakeODBCDriver64Bit",
+            "FileName" : "sap_bo_43/snowflake64_odbc-2.24.5.msi",
+            "Method" : "MSI"
+        }
+    ]
+}
+'@
+
+$mapDriveScript = "
+try {
+    Write-Host ""Getting Credentials From SM""
+    `$adSecretString = Get-SECSecretValue -SecretId ""${ad_secret_id}"" -Select SecretString | ConvertFrom-Json
+    `$fsxDNSName = Get-SECSecretValue -SecretId ""${fsx_secret_id}"" -Select SecretString | ConvertFrom-Json
+    Start-Process cmdkey -ArgumentList "" /add:`$(`$fsxDNSName.fsxDnsName) /user:`$(`$adSecretString.netbiosDomain)\`$(`$adSecretString.username) /pass:`$(`$adSecretString.password)"" -Wait 
+    Start-Process net -ArgumentList ""use Z: \\`$(`$fsxDNSName.fsxDnsName)\share /PERSISTENT:YES"" -Wait 
+    Write-Host ""Successfully Mounted FsX""
+} catch {
+    Write-Host ""Error Mounting FsX Drive:  `$(`$_.Exception.Message)""
+}"
+
+$mapDriveCmd = "PowerShell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '""C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.ps1""'"""
+
+#Functions
+function Check_App_Installed( $appName ) {
+    
+    $return = $false
+    $stringReturn = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*).DisplayName | Where-Object {$_ -like "*$appName*"}
+    if ($stringReturn.Length -gt 0) {
+        $return = $true
+    } else {
+        $stringReturn = [string](Get-WMIObject -Query "SELECT * FROM Win32_Product Where Name Like '%$appName%'")
+        if ($stringReturn.Length -gt 0) {
+            $return = $true
+        }
+    }
+    return $return
+}
+
+function logMessage( $logLevel, $msgText ) {
+    $logStamp = (Get-Date).toString("yyyy-MM-dd HH:mm:ss")
+    $content = "$logStamp  $logLevel  $msgText"
+    Write-Host $content
+    Add-Content -Value $content -Path $logFileName
+}
+
+#Check and Print Current User
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+logMessage("INFO", "PowerShell current user is:  $currentUser")
+
+#Format Second Disk And Mount As D
+try {
+    $newDisk = Get-Disk | where partitionstyle -eq 'RAW'
+    if (-not($newDisk -eq $null)) {
+        logMessage("INFO", "Beginning To Format and Mount Second Disk")
+        Set-Disk -Number $newDisk.DiskNumber -IsOffline $false
+        Set-Disk -Number $newDisk.DiskNumber -IsReadOnly $false
+        Initialize-Disk -Number $newDisk.DiskNumber -PartitionStyle MBR -PassThru
+        New-Partition -DiskNumber $newDisk.DiskNumber -DriveLetter 'D' -UseMaximumSize
+        Format-Volume -FileSystem NTFS -DriveLetter 'D' -NewFileSystemLabel "Software" -Confirm:$false
+        logMessage("INFO", "Completed Format and Mount of Second Disk")
+    } else {
+        logMessage("INFO", "Second Disk Already Mounted and Formatted")
+    }
+} catch {
+    logMessage("ERROR", "Failed to Format and Mount Second Disk: $($_.Exception.Message)")
+}
+
+#Create Install Root Dir - Need to add an existance check first
+try {
+    logMessage("INFO", "Creating Install Root Dir")
+    New-Item -Path $installRootDir -ItemType Directory
+    logMessage("INFO", "Created Install Root Dir")
+} catch {
+    logMessage("ERROR", "Error Creating Install Root Dir: $($_.Exception.Message)")
+}
+
+logMessage("INFO", "Creating Windows Update Task")
+try {
+    logMessage("INFO", "Reading Metadata")
+    $response = Invoke-RestMethod -uri "http://169.254.169.254/latest/meta-data/placement/availability-zone"
+    $az = $response.Substring(9,1)
+    $response2 = Invoke-RestMethod -uri "http://169.254.169.254/latest/meta-data/tags/instance/Environment"
+    $env = $response2
+
+    switch($env) {
+        "POC" {$dayOfWeek = "Tuesday"}
+        "DEV" {$dayOfWeek = "Tuesday"}
+        "PREPROD" {$dayOfWeek = "Wednesday"}
+        "PROD" {$dayOfWeek = "Saturday"}
+    }
+
+    switch($az) {
+        "a" {$timeOfDay = "8pm"}
+        "b" {$timeOfDay = "11pm"}
+        "c" {$timeOfDay = "11pm"}
+    }
+} catch {
+    logMessage("ERROR", "Error Reading Metadata: $($_.Exception.Message)")
+}
+
+try {
+    logMessage("INFO", "Creating Update Task")
+    $createTask = $true
+    try {
+        $currentTasks = Get-ScheduledTask -TaskPath "\*"
+        ForEach ($task in $currentTasks) {
+            if ($task.TaskName -eq "Execute Windows Update") {
+                $createTask = $false
+            }
+        }
+    } catch {
+		logMessage("INFO", "Update Task Exists")
+    }
+
+	$ir = "C:\Temp\CustomScripts"
+	if( -not (Test-Path $ir)) {
+		New-Item -Path $ir -ItemType Directory
+	}
+
+	$sp = "C:\Temp\CustomScripts\windows-update.ps1"
+    if( -not (Test-Path $sp)) {
+		Copy-S3Object -BucketName $s3BucketName -Key 'windows_scripts/windows-update.ps1' -LocalFolder 'C:\Temp\CustomScripts\'
+	}
+
+    if ($createTask) {
+        try {
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayOfWeek -At $timeOfDay
+            $action = New-ScheduledTaskAction -Execute "C:\Windows\System32\cmd.exe" -Argument "/C C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '""C:\Temp\CustomScripts\windows_scripts\windows-update.ps1""'"""
+            $user = "administrator"
+			$tp = New-ScheduledTaskPrincipal -UserId $user -RunLevel Highest -LogonType S4U
+			Register-ScheduledTask -TaskName "Execute Windows Update" -Trigger $trigger -Principal $tp -Action $action -Force
+			Set-Service -Name wuauserv -StartupType Manual
+            Write-Host "Created Windows Update Task"
+        } catch {
+            Write-Host "Error Creating Task:  $($_.Exception.Message)"
+        }
+    }
+} catch {
+    logMessage("ERROR", "Error Creating Update Task: $($_.Exception.Message)")
+}
+
+#Add To Domain
+logMessage("INFO", "Checking Domain Membership")
+$membershipInfo = Get-WmiObject -Namespace root\cimv2 -Class Win32_ComputerSystem | Select Name, Domain
+
+logMessage("INFO", "Current Domain Membership:  $($membershipInfo.Domain)")
+if($membershipInfo.Domain -eq "WORKGROUP") {
+    try {
+        logMessage("INFO", "Obtaining Domain Secret Details")
+        # Get AD Details from Secrets Manager
+        $adSecretString = Get-SECSecretValue -SecretId '${ad_secret_id}' -Select SecretString | ConvertFrom-Json
+        $pass = $adSecretString.password | ConvertTo-SecureString -asPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($adSecretString.username,$pass)
+        try {
+            logMessage("INFO", "Adding Machine To Domain: $($adSecretString.domainName)")
+            Add-Computer -Verbose -DomainName $adSecretString.domainName -OUPath $adSecretString.distinguishedName -Credential $credential -Restart -Force -PassThru
+        } catch {
+            logMessage("ERROR", "Error Adding Machine To Domain:  $($_.Exception.Message)")
+        }
+    } catch {
+        logMessage("ERROR", "Error Obtaining Domain Secrets:  $($_.Exception.Message)")
+    }
+}
+
+#Disable UAC
+logMessage("INFO", "Checking UAC Setting")
+$CurrentUACValue = Get-ItemPropertyValue -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System' -Name ConsentPromptBehaviorAdmin
+if(-not($CurrentUACValue -match 0)) {
+    try {
+        logMessage("INFO", "UAC Setting Enabled..Disabling")
+        Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System' -Name ConsentPromptBehaviorAdmin -Value 0
+        logMessage("INFO", "UAC Setting Disabled..Restarting")
+        Restart-Computer -Force
+    } catch {
+        logMessage("ERROR", "Error Disabling UAC:  $($_.Exception.Message)")
+    }
+}
+
+logMessage("INFO", "AWS CLI Installation Check")
+Try {
+    $InstalledAwsVersion = $(aws --version) | Out-String -ErrorAction SilentlyContinue
+    logMessage("INFO", "Current AWS Version Output:  $InstalledAwsVersion")
+} Catch{}
+if (-not($InstalledAwsVersion -match "aws-cli/")) {
+    logMessage("INFO", "Beginning Installing AWS CLI")
+    $WebClient = New-Object System.Net.WebClient
+    $WebClient.DownloadFile("https://nexus.lseg.stockex.local/repository/aws-cloud-engineering-release/awscli-bundle/windows/awscli-msi-64bit-1.12.106.msi", "C:\Temp\AWSCLIV1.msi")
+    Start-Process msiexec.exe -Wait -ArgumentList '/i C:\Temp\AWSCLIV1.msi  /qn /l*v C:\Temp\aws-cli-install.log' -Verb runAs
+    logMessage("INFO", "Completed Installing AWS CLI")
+}
+
+[System.Environment]::SetEnvironmentVariable("AWS_DEFAULT_REGION","{$default_region}")
+[System.Environment]::SetEnvironmentVariable("SECRET_PATH","${secret_path}", "Machine")
+[System.Environment]::SetEnvironmentVariable("REGION_NAME","${default_region}", "Machine")
+
+[System.Environment]::SetEnvironmentVariable("DRS_BOAPI_SNOWPHRASE", $null, "Machine")
+
+
+$installPackages = $packages|ConvertFrom-Json|select -expand Packages+
+
+
+ForEach ($package in $installPackages) {
+    logMessage("INFO", "Beginning Installing Software Packages")
+    if($package.Method -eq "MSI") {
+        logMessage("INFO", "Beginning Installation of MSI Software Packages")
+        try {
+            $appInstallation = Check_App_Installed($package.PackageName)
+        } catch {}
+        if($appInstallation -match "False") {
+            try {
+                Copy-S3Object -BucketName $s3BucketName -Key $package.FileName -LocalFolder $installRootDir
+                try {
+                    $fileName = $package.FileName.Replace("/", "\")
+                    $argList = "/i $installRootDir$($fileName) /qn"
+                    logMessage("INFO", "Beginning Install of Package $($package.PackageName) with Aguments $argList")
+                    Start-Process msiexec -Wait -ArgumentList $argList -Verb runAs
+                } catch {
+                    logMessage("ERROR", "Installation Of Package Failed on msiexec:  $($_.Exception.Message)")
+                }
+            }
+            catch {
+                logMessage("ERROR", "Installation of $package failed on Download:  $($_.Exception.Message)")
+            }
+        } else {
+            $status = "Application $($package.PackageName) Already Installed"
+            logMessage("INFO", $status)
+        }
+    }
+}
+
+#Set Proxy Vars
+logMessage("INFO", "Configuring Proxy Variables")
+$currentHttpProxy = [System.Environment]::GetEnvironmentVariable("http_proxy")
+logMessage("INFO", "Current http_proxy Value:  $currentHttpProxy")
+if(-not [System.Environment]::GetEnvironmentVariable("http_proxy")) {
+    .('C:\Temp\CET\scripts\configureProxy.ps1')
+
+    $regKeyallusers="HKLM:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    $httpProxy = "http://" + (Get-ItemProperty -path $regKeyallusers).ProxyServer
+    $noProxy = (Get-ItemProperty -path $regKeyallusers).ProxyOverride
+
+    $noProxy = $noProxy.replace(";",",")
+    $noProxy = $noProxy.replace("*","")
+
+    [System.Environment]::SetEnvironmentVariable("http_proxy", $httpProxy, [System.EnvironmentVariableTarget]::Machine)
+    [System.Environment]::SetEnvironmentVariable("https_proxy",$httpProxy, [System.EnvironmentVariableTarget]::Machine)
+    [System.Environment]::SetEnvironmentVariable("no_proxy", $noProxy, [System.EnvironmentVariableTarget]::Machine)
+
+    logMessage("INFO", "Proxy Variables Configured.  HTTP(s) Proxy:  $httpProxy  NoProxy:  $noProxy")
+}
+
+logMessage("INFO", "Python Installation Check")
+Try {
+    $InstalledPythonVersion = $(python --version) | Out-String -ErrorAction SilentlyContinue
+    logMessage("INFO", "Current Ptyhon Version Output:  $InstalledPythonVersion")
+} Catch{}
+
+if (-not($InstalledPythonVersion -match "Python 3.7")) {
+    logMessage("INFO", "Beginning Installing Python")
+    Try {
+        $localFile = "$($installRootDir)python-3.7.2-amd64.exe"
+        $WebClient = New-Object System.Net.WebClient
+        $WebClient.DownloadFile("https://nexus.lseg.stockex.local/repository/aws-cloud-engineering-release/python/windows/python-3.7.2-amd64.exe", $localFile)
+        Start-Process -FilePath $localFile -ArgumentList "/quiet InstallAllUsers=1 PrependPath=1 Include_test=0 DefaultAllUsersTargetDir=D:\apps\Python3.7\" -Wait -Verb runAs
+        #Refresh Path
+        $env:Path = [System.Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [System.Environment]::GetEnvironmentVariable("Path","User")
+        logMessage("INFO", "Completed Installing Python")
+    } Catch {
+        logMessage("ERROR", "Error Installing Python:  $($_.Exception.Message)")
+    }
+}
+
+logMessage("INFO", "Installing Pre-Reqs")
+Try {
+    Start-Process python.exe -ArgumentList "-m pip install --upgrade pip --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    Start-Process python.exe -ArgumentList "-m pip install Flask --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    Start-Process python.exe -ArgumentList "-m pip install psutil --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    Start-Process python.exe -ArgumentList "-m pip install snowflake-connector-python --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    Start-Process python.exe -ArgumentList "-m pip install pandas --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    Start-Process python.exe -ArgumentList "-m pip install boto3 --index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple --trusted-host nexus.lseg.stockex.local" -Wait -Verb runAs
+    logMessage("INFO", "Pre-Reqs Installation Completed")  
+} Catch {
+    logMessage("ERROR", "Error Installing Pre-Reqs:  $($_.Exception.Message)")
+}
+
+
+#Set Startup Script For Drive Mount
+try {
+    $startupFile = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.ps1"
+    if( -not (Test-Path $startupFile)) {
+        logMessage("INFO", "Putting Startup Script For FsX Mount")
+        $mapDriveScript | Out-File -FilePath $startupFile -encoding ascii
+        logMessage("INFO", "Created Startup Script $startupFile")
+    }
+    $startupCmdFile = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.cmd"
+    if( -not (Test-Path $startupCmdFile)) {
+        logMessage("INFO", "Putting Startup Script For FsX Mount")
+        $mapDriveCmd | Out-File -FilePath $startupCmdFile -encoding ascii
+        logMessage("INFO", "Created Startup Script $startupCmdFile")
+    }
+} catch {
+    logMessage("ERROR", "FsX Startup Script Copy Failed:  $($_.Exception.Message)")
+}
+
+#Adding Firewall Firewall Rules
+try {
+    logMessage("INFO", "Adding Firewall Rules")
+    $firewallRule = Get-NetFirewallRule -DisplayName "BO API Allow Port 8089 Inbound" -ErrorAction SilentlyContinue
+    if($firewallRule.DisplayName.Length -eq 0) {
+        New-NetFirewallRule -DisplayName "BO API Allow Port 8089 Inbound" -Direction Inbound -Profile Any -Action Allow -LocalPort 8089 -Protocol TCP
+    }
+    $firewallRule = Get-NetFirewallRule -DisplayName "BO API Allow Port 8089 Outbound" -ErrorAction SilentlyContinue
+    if($firewallRule.DisplayName.Length -eq 0) {
+        New-NetFirewallRule -DisplayName "BO API Allow Port 8089 Outbound" -Direction Outbound -Profile Any -Action Allow -LocalPort 8089 -Protocol TCP
+    }
+} catch {
+    logMessage("ERROR", "Error Adding Firewall Rules:  $($_.Exception.Message)")
+}
+
+logMessage("INFO", "UserData Script Run To Completion")
+</powershell>
+<persist>True</persist>

@@ -1,0 +1,154 @@
+def RESULT_CREDS
+
+def saml2aws_credentials_dir() {
+  def postfix_dir_name = UUID.randomUUID().toString().substring(0,5)
+  def creds_dir = "${env.WORKSPACE_TMP}" + "/" + postfix_dir_name + "/.aws"
+  sh "mkdir -p ${creds_dir}"
+  return "-v ${creds_dir}:/home/jenkins/.aws"
+}
+
+def ReadCommandResults(Command){
+       return sh(returnStdout: true, script: Command).trim()
+}
+
+pipeline {
+    agent {
+        label 'On-Demand-LCH-Sno-Conrep-V1'
+    }
+    environment {
+         AD_SERVICE_ACCOUNT = credentials('ADServiceAccount')
+    IAM_ROLE_ARN = 'arn:aws:iam::522557265874:role/lch-sno-poc-fulladmin-adfs-role'
+    HTTP_PROXY = """${sh(
+                    returnStdout: true,
+                    script: "echo http://${http_proxy}"
+    ).trim()}"""
+    HTTPS_PROXY = """${sh(
+                    returnStdout: true,
+                    script: "echo http://${http_proxy}"
+    ).trim()}"""
+    NO_PROXY = """${sh(
+                    returnStdout: true,
+                    script: "echo .privatelink.snowflakecomputing.com,sts.lseg.com,${no_proxy}"
+    ).trim()}"""
+    mwaa_bucket_name = 'lch-sno-poc-s3-mwaa' //name of the s3 bucket
+    dags_path = 'dags'
+    }
+    options {
+        disableConcurrentBuilds()
+    }
+    stages {
+      
+stage('Deploying docker') {
+                    
+                       agent {
+                             docker {
+                              label 'On-Demand-LCH-Sno-Conrep-V1'
+                              image 'nexus-docker-1.lseg.stockex.local:443/lch-sno-poc-ecr-cicdjenkins-go:v0.1'
+                              registryUrl 'https://nexus-docker-1.lseg.stockex.local:443'
+                              registryCredentialsId 'ADServiceAccount'
+                              args saml2aws_credentials_dir()
+                              reuseNode true
+                            }
+                         
+                        }
+                        stages {
+                            stage('SAML2AWS Authentication') {
+                              environment {
+                                    SAML2AWS_USERNAME = "lseg\\${AD_SERVICE_ACCOUNT_USR}"
+                                    SAML2AWS_PASSWORD = "${AD_SERVICE_ACCOUNT_PSW}"
+                                    SAML2AWS_ROLE = "${IAM_ROLE_ARN}"
+                             }
+                              steps {
+                                  script{
+                                          
+                                          RESULT_CREDS = sh(script:'''
+                                          set +x
+                                          saml2aws configure --mfa=Auto --url=https://sts.lseg.com   --cache-saml --idp-provider=ADFS --skip-prompt
+                                          saml2aws login --force --skip-prompt
+                                          
+                                          eval $(saml2aws script)
+                                         
+                                          INI_FILE=/home/jenkins/.aws/credentials
+                                          
+                                          while IFS=' = ' read \$key \$value
+                                          do
+                                              if [[ \$key == \\[*] ]]; then
+                                                  section=\$key
+                                              elif [[ \$value ]] && [[ \$section == '[saml]' ]]; then
+                                                  if [[ \$key == 'aws_access_key_id' ]]; then
+                                                      AWS_ACCESS_KEY_ID=\$value
+                                                  elif [[ \$key == 'aws_secret_access_key' ]]; then
+                                                      AWS_SECRET_ACCESS_KEY=\$value
+                                                  elif [[ \$key == 'aws_session_token' ]]; then
+                                                      AWS_SESSION_TOKEN=\$value
+                                                  elif [[ \$key == 'aws_security_token' ]]; then
+                                                      AWS_SECURITY_TOKEN=\$value
+                                                  elif [[ \$key == 'aws_credential_expiration' ]]; then
+                                                      AWS_CREDENTIAL_EXPIRATION=\$value
+                                                      
+                                                  fi
+                                              fi
+                                              done < \$INI_FILE
+                                          
+                                          result="export AWS_ACCESS_KEY_ID=\$AWS_ACCESS_KEY_ID \$n
+                                          export AWS_SECRET_ACCESS_KEY=\$AWS_SECRET_ACCESS_KEY \$n
+                                          export AWS_SESSION_TOKEN=\$AWS_SESSION_TOKEN \$n
+                                          export AWS_SECURITY_TOKEN=\$AWS_SECURITY_TOKEN  \$n
+                                          export AWS_CREDENTIAL_EXPIRATION=\$AWS_CREDENTIAL_EXPIRATION"
+                                          
+                                          echo \$result >> tokens.txt ''', returnStdout:true)
+                                          
+                                          stash name: 'tokens', includes: 'tokens.txt'
+                                          
+                                        }
+
+                                    }
+                                }
+
+                         }
+      
+                }
+                   stage ('Upload DAG files to MWAA S3') {
+                       
+                        steps {
+                            withPythonEnv("python3"){
+                               
+                                sh '''
+                                python3 -m pip install --upgrade pip
+                                pip3 install boto3
+                                
+                                '''
+                            dir('nrt-generator') {
+                                git credentialsId: 'jenkinsuvaws', branch: 'main', url: 'ssh://git@bitbucket.unix.lch.com:7999/dsrcp/terraform-aws-mwaa.git'
+                            }
+                            dir('nrt-generator') {
+                                
+                               unstash 'tokens'
+                                sh '''
+                                set +x
+                                source "./tokens.txt"
+                               
+                                set -x
+                                cd \${dags_path}
+                                
+                                python main.py --bucket \${mwaa_bucket_name} --directory ${PWD}
+                            '''
+                            }
+                                
+                            }
+                        }
+                    }
+              
+            }
+        
+
+      
+
+    
+    post {
+        always {
+            cleanWs()
+        }
+    }
+}
+

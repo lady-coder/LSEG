@@ -1,0 +1,369 @@
+<powershell>
+$s3BucketName = "${s3_bucket}"
+$installRootDir = "D:\Temp\"
+$oracleHome = "D:\apps\Oracle\Product\19.0.0\Client64"
+$oracleBase = "D:\apps\Oracle"
+
+$packages = @'
+{
+    "Packages" : [
+        {
+            "PackageName" : "SnowflakeODBCDriver32Bit",
+            "FileName" : "sap_bo_43/snowflake32_odbc-2.24.5.msi",
+            "Method" : "MSI"      
+        },
+        {
+            "PackageName" : "SnowflakeODBCDriver64Bit",
+            "FileName" : "sap_bo_43/snowflake64_odbc-2.24.5.msi",
+            "Method" : "MSI"
+        },
+        {
+            "PackageName" : "Oracle19cClient",
+            "FileName" : "sap_bo_43/Oracle19cClient.zip",
+            "Method" : "OracleClient"
+        },
+        {
+            "PackageName" : "WinRAR",
+            "FileName" : "sap_bo_43/winrar-x64-591.exe",
+            "Method" : "SetupFile",
+            "Params": "/S"
+        },
+        {
+            "PackageName" : "Microsoft Visual C++ 2019 X64 Additional Runtime",
+            "FileName" : "sap_bo_43/VC_redist.x64.exe",
+            "Method" : "SetupFile",
+            "Params" : "/install /quiet /norestart"
+        }
+    ]
+}
+'@
+
+$tnsNames = "${tns_alias}=
+(
+    DESCRIPTION =
+        (ADDRESS = (PROTOCOL = TCP)(HOST = ${rds_host})(PORT = 1521)
+    )
+    (CONNECT_DATA =
+        (SERVER = DEDICATED)
+        (SERVICE_NAME = SAPBOXI)
+    )
+)"
+
+$scriptDate = (Get-Date).toString("yyyyMMddHHmmss")
+$logFileName = "C:\Temp\UserDataLog_$scriptDate.log"
+
+$mapDriveScript = "
+try {
+    Write-Host ""Getting Credentials From SM""
+    `$adSecretString = Get-SECSecretValue -SecretId ""${ad_secret_id}"" -Select SecretString | ConvertFrom-Json
+    `$fsxDNSName = Get-SECSecretValue -SecretId ""${fsx_secret_id}"" -Select SecretString | ConvertFrom-Json
+    Start-Process cmdkey -ArgumentList "" /add:`$(`$fsxDNSName.fsxDnsName) /user:`$(`$adSecretString.netbiosDomain)\`$(`$adSecretString.username) /pass:`$(`$adSecretString.password)"" -Wait 
+    Start-Process net -ArgumentList ""use Z: \\`$(`$fsxDNSName.fsxDnsName)\share /PERSISTENT:YES"" -Wait 
+    Write-Host ""Successfully Mounted FsX""
+} catch {
+    Write-Host ""Error Mounting FsX Drive:  `$(`$_.Exception.Message)""
+}"
+
+$mapDriveCmd = "PowerShell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '""C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.ps1""'"""
+
+#Functions
+function Check_App_Installed( $appName ) {
+    
+    $return = $false
+    $stringReturn = (Get-ItemProperty HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\*).DisplayName | Where-Object {$_ -like "*$appName*"}
+    if ($stringReturn.Length -gt 0) {
+        $return = $true
+    } else {
+        $stringReturn = [string](Get-WMIObject -Query "SELECT * FROM Win32_Product Where Name Like '%$appName%'")
+        if ($stringReturn.Length -gt 0) {
+            $return = $true
+        }
+    }
+    return $return
+}
+
+function logMessage( $logLevel, $msgText ) {
+    $logStamp = (Get-Date).toString("yyyy-MM-dd HH:mm:ss")
+    $content = "$logStamp  $logLevel  $msgText"
+    Write-Host $content
+    Add-Content -Value $content -Path $logFileName
+}
+
+#Check and Print Current User
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+logMessage("INFO", "PowerShell current user is:  $currentUser")
+
+#Format Second Disk And Mount As D
+try {
+    $newDisk = Get-Disk | where partitionstyle -eq 'RAW'
+    if (-not($newDisk -eq $null)) {
+        logMessage("INFO", "Beginning To Format and Mount Second Disk")
+        Set-Disk -Number $newDisk.DiskNumber -IsOffline $false
+        Set-Disk -Number $newDisk.DiskNumber -IsReadOnly $false
+        Initialize-Disk -Number $newDisk.DiskNumber -PartitionStyle MBR -PassThru
+        New-Partition -DiskNumber $newDisk.DiskNumber -DriveLetter 'D' -UseMaximumSize
+        Format-Volume -FileSystem NTFS -DriveLetter 'D' -NewFileSystemLabel "Software" -Confirm:$false
+        logMessage("INFO", "Completed Format and Mount of Second Disk")
+    } else {
+        logMessage("INFO", "Second Disk Already Mounted and Formatted")
+    }
+} catch {
+    logMessage("ERROR", "Failed to Format and Mount Second Disk: $($_.Exception.Message)")
+}
+
+logMessage("INFO", "Creating Windows Update Task")
+try {
+    logMessage("INFO", "Reading Metadata")
+    $response = Invoke-RestMethod -uri "http://169.254.169.254/latest/meta-data/placement/availability-zone"
+    $az = $response.Substring(9,1)
+    $response2 = Invoke-RestMethod -uri "http://169.254.169.254/latest/meta-data/tags/instance/Environment"
+    $env = $response2
+
+    switch($env) {
+        "POC" {$dayOfWeek = "Tuesday"}
+        "DEV" {$dayOfWeek = "Tuesday"}
+        "PREPROD" {$dayOfWeek = "Wednesday"}
+        "PROD" {$dayOfWeek = "Saturday"}
+    }
+
+    switch($az) {
+        "a" {$timeOfDay = "8pm"}
+        "b" {$timeOfDay = "11pm"}
+        "c" {$timeOfDay = "11pm"}
+    }
+} catch {
+    logMessage("ERROR", "Error Reading Metadata: $($_.Exception.Message)")
+}
+
+try {
+    logMessage("INFO", "Creating Update Task")
+    $createTask = $true
+    try {
+        $currentTasks = Get-ScheduledTask -TaskPath "\*"
+        ForEach ($task in $currentTasks) {
+            if ($task.TaskName -eq "Execute Windows Update") {
+                $createTask = $false
+            }
+        }
+    } catch {
+		logMessage("INFO", "Update Task Exists")
+    }
+
+	$ir = "C:\Temp\CustomScripts"
+	if( -not (Test-Path $ir)) {
+		New-Item -Path $ir -ItemType Directory
+	}
+
+	$sp = "C:\Temp\CustomScripts\windows-update.ps1"
+    if( -not (Test-Path $sp)) {
+		Copy-S3Object -BucketName $s3BucketName -Key 'windows_scripts/windows-update.ps1' -LocalFolder 'C:\Temp\CustomScripts\'
+	}
+
+    if ($createTask) {
+        try {
+            $trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $dayOfWeek -At $timeOfDay
+            $action = New-ScheduledTaskAction -Execute "C:\Windows\System32\cmd.exe" -Argument "/C C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe -NoProfile -ExecutionPolicy Bypass -Command ""& '""C:\Temp\CustomScripts\windows_scripts\windows-update.ps1""'"""
+            $user = "administrator"
+			$tp = New-ScheduledTaskPrincipal -UserId $user -RunLevel Highest -LogonType S4U
+			Register-ScheduledTask -TaskName "Execute Windows Update" -Trigger $trigger -Principal $tp -Action $action -Force
+			Set-Service -Name wuauserv -StartupType Manual
+            Write-Host "Created Windows Update Task"
+        } catch {
+            Write-Host "Error Creating Task:  $($_.Exception.Message)"
+        }
+    }
+} catch {
+    logMessage("ERROR", "Error Creating Update Task: $($_.Exception.Message)")
+}
+
+#Add To Domain
+logMessage("INFO", "Checking Domain Membership")
+$membershipInfo = Get-WmiObject -Namespace root\cimv2 -Class Win32_ComputerSystem | Select Name, Domain
+
+logMessage("INFO", "Current Domain Membership:  $($membershipInfo.Domain)")
+if($membershipInfo.Domain -eq "WORKGROUP") {
+    try {
+        logMessage("INFO", "Obtaining Domain Secret Details")
+        # Get AD Details from Secrets Manager
+        $adSecretString = Get-SECSecretValue -SecretId '${ad_secret_id}' -Select SecretString | ConvertFrom-Json
+        $pass = $adSecretString.password | ConvertTo-SecureString -asPlainText -Force
+        $credential = New-Object System.Management.Automation.PSCredential($adSecretString.username,$pass)
+        try {
+            logMessage("INFO", "Adding Machine To Domain: $($adSecretString.domainName)")
+            Add-Computer -Verbose -DomainName $adSecretString.domainName -OUPath $adSecretString.distinguishedName -Credential $credential -Restart -Force -PassThru
+        } catch {
+            logMessage("ERROR", "Error Adding Machine To Domain:  $($_.Exception.Message)")
+        }
+    } catch {
+        logMessage("ERROR", "Error Obtaining Domain Secrets:  $($_.Exception.Message)")
+    }
+}
+
+#Turn Off Windows Firewall - This is largely redundant as the computer isn't internet facing and is in a Security Group
+try {
+    logMessage("INFO", "Turning Off Windows Firewall")
+    Set-NetFirewallProfile -Profile Domain, Public, Private -Enabled False
+    logMessage("INFO", "Windows Firewall Disabled")
+} catch {
+    logMessage("ERROR", "Error Disabling Firewall:  $($_.Exception.Message)")
+}
+
+#Disable UAC
+logMessage("INFO", "Checking UAC Setting")
+$CurrentUACValue = Get-ItemPropertyValue -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System' -Name ConsentPromptBehaviorAdmin
+if(-not($CurrentUACValue -match 0)) {
+    try {
+        logMessage("INFO", "UAC Setting Enabled..Disabling")
+        Set-ItemProperty -Path 'HKLM:\Software\Microsoft\Windows\CurrentVersion\Policies\System' -Name ConsentPromptBehaviorAdmin -Value 0
+        logMessage("INFO", "UAC Setting Disabled..Restarting")
+        Restart-Computer -Force
+    } catch {
+        logMessage("ERROR", "Error Disabling UAC:  $($_.Exception.Message)")
+    }
+}
+
+#Disable Antivirus
+try {
+    Set-MpPreference -DisableRealTimeMonitoring $true
+} catch {
+    logMessage("ERROR", "Error Disabling Antivirus:  $($_.Exception.Message)")
+}
+
+logMessage("INFO", "AWS CLI Installation Check")
+Try {
+    $InstalledAwsVersion = $(aws --version) | Out-String -ErrorAction SilentlyContinue
+    logMessage("INFO", "Current AWS Version Output:  $InstalledAwsVersion")
+} Catch{}
+if (-not($InstalledAwsVersion -match "aws-cli/")) {
+    logMessage("INFO", "Beginning Installing AWS CLI")
+    $WebClient = New-Object System.Net.WebClient
+    $WebClient.DownloadFile("https://nexus.lseg.stockex.local/repository/aws-cloud-engineering-release/awscli-bundle/windows/awscli-msi-64bit-1.12.106.msi", "C:\Temp\AWSCLIV1.msi")
+    Start-Process msiexec.exe -Wait -ArgumentList '/i C:\Temp\AWSCLIV1.msi  /qn /l*v C:\Temp\aws-cli-install.log' -Verb runAs
+    logMessage("INFO", "Completed Installing AWS CLI")
+}
+
+[System.Environment]::SetEnvironmentVariable("AWS_DEFAULT_REGION","{$default_region}")
+
+$installPackages = $packages|ConvertFrom-Json|select -expand Packages
+
+ForEach ($package in $installPackages) {
+    logMessage("INFO", "Beginning Installing Software Packages")
+    if($package.Method -eq "MSI") {
+        logMessage("INFO", "Beginning Installation of MSI Software Packages")
+        try {
+            $appInstallation = Check_App_Installed($package.PackageName)
+        } catch {}
+        if($appInstallation -match "False") {
+            try {
+                Copy-S3Object -BucketName $s3BucketName -Key $package.FileName -LocalFolder $installRootDir
+                try {
+                    $fileName = $package.FileName.Replace("/", "\")
+                    $argList = "/i $installRootDir$($fileName) /qn"
+                    logMessage("INFO", "Beginning Install of Package $($package.PackageName) with Aguments $argList")
+                    Start-Process msiexec -Wait -ArgumentList $argList -Verb runAs
+                } catch {
+                    logMessage("ERROR", "Installation Of Package Failed on msiexec:  $($_.Exception.Message)")
+                }
+            }
+            catch {
+                logMessage("ERROR", "Installation of $package failed on Download:  $($_.Exception.Message)")
+            }
+        } else {
+            $status = "Application $($package.PackageName) Already Installed"
+            logMessage("INFO", $status)
+        }
+    }
+    if($package.Method -eq "OracleClient") {
+        logMessage("INFO", "Beginning Installation Oracle Client")
+        if (-not (Test-Path $oracleHome)) {
+            try {
+                Copy-S3Object -BucketName $s3BucketName -Key $package.FileName -LocalFolder $installRootDir
+                $litPath = "$installRootDir$($package.FileName)"
+                $destPath = "$($installRootDir)Oracle19cClient"
+                if(Test-Path $destPath) {
+                    Remove-Item $destPath -Recurse
+                }
+                logMessage("INFO", "Inflating Archive $litPath")
+                Expand-Archive -LiteralPath $litPath -DestinationPath $installRootDir
+                $litPath2 = "$($installRootDir)Oracle19cClient\WINDOWS.X64_193000_client.zip"
+                $destPath2 = "$($installRootDir)OracleClientInstall\"
+                if(Test-Path $destPath2) {
+                    Remove-Item $destPath2 -Recurse
+                }
+                logMessage("INFO", "Inflating Archive $litPath2")
+                Expand-Archive -LiteralPath $litPath2 -DestinationPath $destPath2
+                try {
+                    #$installCommand = "$($destPath2)client\setup.exe -silent -ignoreSysPrereqs -ignorePrereqFailure -waitForCompletion -force ""ORACLE_HOME=$oracleHome"" ""ORACLE_BASE=$oracleBase"" ""oracle.install.IsBuiltInAccount=true"" ""oracle.install.client.installType=Administrator"""
+                    #logMessage("INFO", "Oracle Client Installation Beginning with command:  $installCommand")
+                    #$installScriptBlock = [ScriptBlock]::Create($installCommand)
+                    #$job = Invoke-Command -ScriptBlock $installScriptBlock
+                    #Wait-Job -Job $job
+                    $processName = "$($destPath2)client\setup.exe"
+                    $args = "-silent -nowait -ignoreSysPrereqs -ignorePrereqFailure -force ""ORACLE_HOME=$oracleHome"" ""ORACLE_BASE=$oracleBase"" ""oracle.install.IsBuiltInAccount=true"" ""oracle.install.client.installType=Administrator"""
+                    Start-Process -FilePath $processName -ArgumentList $args -Wait
+                    logMessage("INFO", "Oracle Client Installation Complete")
+                } catch {
+                    logMessage("ERROR", "Installation Of Package $($package.PackageName) Failed on Setup:  $($_.Exception.Message)")
+                }
+            }
+            catch {
+                logMessage("ERROR", "Installation of $($package.PackageName) failed on Download:  $($_.Exception.Message)")
+            }
+        } else {
+            $status = "Application $($package.PackageName) Already Installed"
+            logMessage("INFO", $status)
+        }
+    }
+    if($package.Method -eq "SetupFile") {
+        logMessage("INFO", "Beginning Installation of SetupFile Software Packages")
+        try {
+            $appInstallation = Check_App_Installed($package.PackageName)
+        } catch {}
+        if($appInstallation -match "False") {
+            Copy-S3Object -BucketName $s3BucketName -Key $package.FileName -LocalFolder $installRootDir
+            try {
+                $processName = "$($installRootDir)$($package.FileName)"
+                Start-Process -FilePath $processName -ArgumentList $package.Params -Wait
+                logMessage("INFO", "Installation of $($package.PackageName) Complete")
+            } catch {
+                logMessage("ERROR", "Installation Of Package $($package.PackageName) Failed on Setup:  $($_.Exception.Message)")
+            }
+        } else {
+            logMessage("INFO", "Application $($package.PackageName) Already Installed")
+        }
+    }
+}
+
+#Setup TNS Names
+try {
+    logMessage("INFO", "Oracle TNSNames Setup")
+    $tnsFile = "$oracleHome\network\admin\tnsnames.ora"
+    if( -not (Test-Path $tnsFile)) {
+        $tnsNames | Out-File -FilePath $tnsFile -encoding ascii
+        logMessage("INFO", "Created TNS Names $tnsFile")
+    }
+} catch {
+    logMessage("ERROR", "TNSNames Setup Failed:  $($_.Exception.Message)")
+}
+
+#Set Startup Script For Drive Mount
+try {
+    $startupFile = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.ps1"
+    if( -not (Test-Path $startupFile)) {
+        logMessage("INFO", "Putting Startup Script For FsX Mount")
+        $mapDriveScript | Out-File -FilePath $startupFile -encoding ascii
+        logMessage("INFO", "Created Startup Script $startupFile")
+    }
+    $startupCmdFile = "C:\ProgramData\Microsoft\Windows\Start Menu\Programs\StartUp\MapFsX.cmd"
+    if( -not (Test-Path $startupCmdFile)) {
+        logMessage("INFO", "Putting Startup Script For FsX Mount")
+        $mapDriveCmd | Out-File -FilePath $startupCmdFile -encoding ascii
+        logMessage("INFO", "Created Startup Script $startupCmdFile")
+    }
+} catch {
+    logMessage("ERROR", "FsX Startup Script Copy Failed:  $($_.Exception.Message)")
+}
+
+logMessage("INFO", "UserData Script Run To Completion")
+</powershell>
+<persist>True</persist>

@@ -1,0 +1,81 @@
+#cloud-boothook
+#!/bin/bash
+
+export AWS_DEFAULT_REGION=${region}
+
+source /etc/profile.d/proxy_install.sh
+
+SECRETS=$(/usr/local/bin/aws secretsmanager --region ${region} get-secret-value --secret-id ${secret_id_env})
+
+echo "Secrets retrieved successfully $SECRETS"
+
+
+DD_API_KEY=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['DD_API_KEY'])")
+SF_ACCOUNT=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['SF_ACCOUNT'])")
+SF_USER=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['SF_USER'])")
+SF_PASSWORD=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['SF_PASSWORD'])")
+SF_WAREHOUSE=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['SF_WAREHOUSE'])")
+SF_ROLE=$(python3 -c "import sys, json; print(json.loads($SECRETS['SecretString'])['SF_ROLE'])")
+
+echo $DD_API_KEY
+echo $SF_ACCOUNT
+
+DDCONF=/etc/datadog-agent/datadog.yaml
+CONFTEMPLATE=/etc/datadog-agent/conf.d/snowflake.d/conf.yaml.example
+
+
+if [ -f "$DDCONF" ] && grep "REPLACE_API_KEY" $DDCONF; then
+        echo "$DDCONF exists"
+        ddfile=$DDCONF
+else
+        echo "Replace key not found"
+        DDCPY=`/usr/local/bin/aws s3 cp s3://${BUCKET_NAME}/datadog.yaml ./temp-conf/datadog.yaml`
+        if [[ -z "$DDCPY" ]];
+        then
+                echo "datadog.yaml download failed"
+                exit 1
+        else
+                ddfile=./temp-conf/datadog.yaml
+        fi
+
+fi
+
+if [ -f "$CONFTEMPLATE" ] && grep "<ACCOUNT>" $CONFTEMPLATE && grep "<USER>" $CONFTEMPLATE; then
+        echo "$CONFTEMPLATE exists"
+        conffile=$CONFTEMPLATE
+else
+        echo "$CONFTEMPLATE -  template file not found. Copying conf file from s3."
+        confcpy=`/usr/local/bin/aws s3 cp s3://${BUCKET_NAME}/conf.yaml.example ./temp-conf/conf.yaml.example`
+        if [[ -z "$confcpy" ]];
+        then
+                echo "conf.yaml.example download failed"
+                exit 1
+        else
+                conffile=./temp-conf/conf.yaml.example
+        fi
+fi
+
+echo "datadog.yaml location -> $ddfile"
+echo "conf.yaml location -> $conffile"
+
+
+echo "======REPLACING SECRETS======="
+sed -i "s/REPLACE_API_KEY/$DD_API_KEY/" $ddfile
+sed -i "s/<ACCOUNT>/$SF_ACCOUNT/" $conffile
+sed -i "s/<USER>/$SF_USER/" $conffile
+sed -i "s/# password:.*/password: $SF_PASSWORD/" $conffile
+sed -i "s/# warehouse:.*/warehouse: $SF_WAREHOUSE/" $conffile
+sed -i "s/<ROLE>/$SF_ROLE/" $conffile
+
+mv $conffile /etc/datadog-agent/conf.d/snowflake.d/conf.yaml
+mv $ddfile	/etc/datadog-agent/datadog.yaml
+
+if [ -f /etc/datadog-agent/conf.d/snowflake.d/conf.yaml ]; then
+        echo "===conf.yaml replaced successfully==="
+else
+        echo "Error while replacing conf.yaml"
+fi
+
+rm -r ./temp-conf
+
+systemctl restart datadog-agent

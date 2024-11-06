@@ -1,0 +1,40 @@
+--index https://nexus.lseg.stockex.local/repository/Pypi-all/simple
+--extra-index-url https://nexus.lseg.stockex.local/repository/Pypi-all/simple
+--trusted-host nexus.lseg.stockex.local
+
+#apache-airflow==2.0.2
+#apache-airflow-providers-amazon==1.3.0
+#apache-airflow-providers-celery==1.0.1
+apache-airflow-providers-ssh==3.2.0
+# apache-airflow-providers-airbyte==3.1.0
+apache-airflow-providers-snowflake==3.3.0
+snowflake-sqlalchemy==1.3.4
+snowflake-connector-python==2.7.8
+
+agate==1.7.0 
+betterproto==1.2.5 
+future==0.18.3 
+grpclib==0.4.3 
+h2==4.1.0 
+hologram==0.0.15 
+hpack==4.0.0 
+hyperframe==6.0.1 
+isodate==0.6.1 
+jsonschema==3.2.0 
+leather==0.3.4 
+logbook==1.5.3 
+mashumaro==3.3.1 
+minimal-snowplow-tracker==0.0.2 
+multidict==6.0.4 
+networkx==2.6.3 
+parsedatetime==2.4 
+psycopg2-binary==2.9.5 
+pytimeparse==1.1.8 
+stringcase==1.2.0
+boto3
+
+dbt-core==1.4.1 
+dbt-extractor==0.4.1 
+# dbt-postgres==1.4.1
+# dbt-redshift==1.4.0
+dbt-snowflake==1.4.1
