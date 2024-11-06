@@ -1,0 +1,3 @@
+@Library('build-cicd') _
+
+terraformModulePipeline label: 'On-Demand-LCH-Sno-Conrep-V1', registryUrl: 'https://nexus-docker-1.lseg.stockex.local:443', fixturesDir: 'examples/complete' 
